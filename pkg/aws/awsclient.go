@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"sync"
 	"time"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
@@ -91,6 +90,11 @@ func (c *AWSClient) ListRoles(ctx context.Context) ([]Role, error) {
 		}
 	}
 
+	// Nothing to hydrate; skip the progress bar and worker pool entirely.
+	if len(roles) == 0 {
+		return roles, nil
+	}
+
 	// Create progress bar
 	bar := progressbar.NewOptions(len(roles),
 		progressbar.OptionEnableColorCodes(true),
@@ -108,89 +112,14 @@ func (c *AWSClient) ListRoles(ctx context.Context) ([]Role, error) {
 		}),
 	)
 
-	// Use worker pool pattern for better efficiency
-	type roleResult struct {
-		index    int
-		lastUsed *time.Time
-		err      error
-	}
-
-	// Define our channels
-	const maxConcurrency = 55
-	jobs := make(chan int, len(roles))
-	results := make(chan roleResult, len(roles))
-
-	// Create a cancellable context
-	ctx, cancel := context.WithCancel(ctx)
-	defer cancel()
-
-	// Create worker pool
-	var wg sync.WaitGroup
-	for w := 0; w < maxConcurrency; w++ {
-		wg.Add(1)
-		go func() {
-			defer wg.Done()
-
-			for i := range jobs {
-				// Check for cancellation
-				select {
-				case <-ctx.Done():
-					return
-				default:
-					// Continue processing
-				}
-
-				lastUsed, err := c.GetRoleLastUsed(ctx, roles[i].Name)
-				select {
-				case <-ctx.Done():
-					return
-				case results <- roleResult{
-					index:    i,
-					lastUsed: lastUsed,
-					err:      err,
-				}:
-					// Result sent
-				}
-			}
-		}()
-	}
-
-	// Send jobs to the workers
-	for i := range roles {
-		jobs <- i
-	}
-	close(jobs) // No more jobs to send
-
-	// Process results in a separate goroutine
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		for i := 0; i < len(roles); i++ {
-			result := <-results
-			if result.err != nil {
-				// Log the error but continue processing other roles
-				fmt.Fprintf(os.Stderr, "Warning: Failed to get last used info for role %s: %v\n", roles[result.index].Name, result.err)
-				// Continue processing - don't cancel everything for one role's error
-				roles[result.index].LastUsed = nil
-			} else {
-				roles[result.index].LastUsed = result.lastUsed
-			}
-			if err := bar.Add(1); err != nil {
-				// Log the error but continue processing
-				fmt.Fprintf(os.Stderr, "Failed to update progress bar: %v\n", err)
-			}
+	// Hydrate each role's last-used timestamp concurrently with a bounded
+	// worker pool that writes results directly into the roles slice.
+	hydrateLastUsed(ctx, roles, defaultListConcurrency, c.GetRoleLastUsed, func() {
+		if err := bar.Add(1); err != nil {
+			fmt.Fprintf(os.Stderr, "Failed to update progress bar: %v\n", err)
 		}
-	}()
+	})
 
-	// Wait for workers to finish
-	go func() {
-		wg.Wait()
-		// Close results channel after all workers are done
-		close(results)
-	}()
-
-	// Wait for either completion or error
-	<-done
 	return roles, nil
 }
 
